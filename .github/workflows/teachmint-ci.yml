@@ -1,0 +1,162 @@
+name: Teachmint CI server
+run-name: Teachmint CI - ${{ inputs.action || github.event.schedule }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Server action
+        required: true
+        type: choice
+        default: status
+        options: [start, stop, status]
+  schedule:
+    # UTC schedules corresponding to 09:00 and 17:00 IST, Monday-Friday.
+    - cron: '30 3 * * 1-5'
+    - cron: '30 11 * * 1-5'
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: teachmint-ci-server
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GCP_PROJECT: teachmint-uat
+  GCP_ZONE: asia-south1-c
+  GCP_VM: android-aosp
+  SSH_USER: uat
+
+jobs:
+  control:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout workflow scripts
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Select operation
+        id: operation
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          REQUESTED_ACTION: ${{ inputs.action }}
+        run: |
+          python3 - <<'PY'
+          import datetime, os
+          from zoneinfo import ZoneInfo
+          action = os.environ['REQUESTED_ACTION']
+          if os.environ['EVENT_NAME'] == 'schedule':
+              action = 'start' if os.environ['EVENT_SCHEDULE'] == '30 3 * * 1-5' else 'stop'
+              now = datetime.datetime.now(ZoneInfo('Asia/Kolkata'))
+              working_hours = now.weekday() < 5 and 9 <= now.hour < 17
+              if (action == 'start') != working_hours:
+                  action = 'skip'
+          if action not in {'start', 'stop', 'status', 'skip'}:
+              raise SystemExit('Unsupported server action')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print('action=' + action, file=output)
+          PY
+
+      - name: Check GCP authentication settings
+        if: steps.operation.outputs.action != 'skip'
+        env:
+          PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+        run: |
+          if [[ -z "$PROVIDER" || -z "$SERVICE_ACCOUNT" ]]; then
+            echo '::error::Configure GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_SERVICE_ACCOUNT repository variables. See README.md.'
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud
+        if: steps.operation.outputs.action != 'skip'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          project_id: teachmint-uat
+
+      - name: Install gcloud
+        if: steps.operation.outputs.action != 'skip'
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+
+      - name: Check or start VM
+        if: steps.operation.outputs.action != 'skip'
+        id: vm
+        env:
+          ACTION: ${{ steps.operation.outputs.action }}
+        run: |
+          state() {
+            gcloud compute instances describe "$GCP_VM" \
+              --project="$GCP_PROJECT" --zone="$GCP_ZONE" --format='value(status)'
+          }
+          current=$(state)
+          if [[ "$ACTION" == start ]]; then
+            for attempt in $(seq 1 30); do
+              case "$current" in
+                RUNNING) break ;;
+                TERMINATED)
+                  gcloud compute instances start "$GCP_VM" \
+                    --project="$GCP_PROJECT" --zone="$GCP_ZONE" --quiet
+                  ;;
+                STOPPING|PROVISIONING|STAGING) sleep 10 ;;
+                *) echo "::error::Unexpected VM state: $current"; exit 1 ;;
+              esac
+              current=$(state)
+            done
+            [[ "$current" == RUNNING ]] || { echo '::error::VM did not start'; exit 1; }
+          fi
+          echo "status=$current" >> "$GITHUB_OUTPUT"
+          echo "VM status: $current" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait for IAP SSH
+        if: steps.vm.outputs.status == 'RUNNING'
+        run: |
+          for attempt in $(seq 1 30); do
+            if gcloud compute ssh "$SSH_USER@$GCP_VM" \
+              --project="$GCP_PROJECT" --zone="$GCP_ZONE" --tunnel-through-iap \
+              --ssh-key-expire-after=1h --quiet --command=true; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo '::error::IAP SSH is unavailable. Check IAM and the IAP SSH firewall rule.'
+          exit 1
+
+      - name: Install server control helper
+        if: steps.vm.outputs.status == 'RUNNING' && steps.operation.outputs.action != 'status'
+        run: |
+          gcloud compute scp scripts/ci_server.py \
+            "$SSH_USER@$GCP_VM:/home/uat/Teachmint-CI/bin/github-ci-control.py" \
+            --project="$GCP_PROJECT" --zone="$GCP_ZONE" --tunnel-through-iap --quiet
+
+      - name: Control services
+        if: steps.vm.outputs.status == 'RUNNING'
+        env:
+          ACTION: ${{ steps.operation.outputs.action }}
+        run: |
+          if [[ "$ACTION" == status ]]; then
+            payload=$(base64 -w0 scripts/ci_server.py)
+            remote="sudo -n /usr/bin/python3 -c \"import base64;exec(base64.b64decode('$payload'))\" status"
+          else
+            remote="sudo -n /usr/bin/python3 /home/uat/Teachmint-CI/bin/github-ci-control.py $ACTION"
+          fi
+          gcloud compute ssh "$SSH_USER@$GCP_VM" \
+            --project="$GCP_PROJECT" --zone="$GCP_ZONE" --tunnel-through-iap --quiet \
+            --command="$remote" | tee server-status.txt
+          cat server-status.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Explain scheduled shutdown
+        if: steps.vm.outputs.status == 'RUNNING' && steps.operation.outputs.action == 'stop'
+        run: |
+          echo 'Shutdown is managed on the server. Jenkins drains existing builds before the services and VM stop. Check status or the server shutdown journal for completion.' >> "$GITHUB_STEP_SUMMARY"
